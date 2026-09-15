@@ -1,7 +1,3 @@
-## ℹ️ 🔴 We moved this project to [Omi repository](https://github.com/BasedHardware/omi). Current repo isn't supported anymore =>
-## ℹ️ 🔴 We moved this project to [Omi repository](https://github.com/BasedHardware/omi). Current repo isn't supported anymore =>
-## ℹ️ 🔴 We moved this project to [Omi repository](https://github.com/BasedHardware/omi). Current repo isn't supported anymore =>
-
 # OpenGlass - Open Source Smart Glasses
 
 Turn any glasses into hackable smart glasses with less than $25 of off-the-shelf components. Record your life, remember people you meet, identify objects, translate text, and more.
