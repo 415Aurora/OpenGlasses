@@ -1,39 +1,43 @@
 import * as React from 'react';
 
-export function useDevice(): [BluetoothRemoteGATTServer | null, () => Promise<void>] {
+const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
 
-    // Create state
-    let deviceRef = React.useRef<BluetoothRemoteGATTServer | null>(null);
-    let [device, setDevice] = React.useState<BluetoothRemoteGATTServer | null>(null);
+export function useDevice() {
+    const [device, setDevice] = React.useState<BluetoothDevice | null>(null);
+    const [connecting, setConnecting] = React.useState(false);
+    const [error, setError] = React.useState<string | undefined>();
 
-    // Create callback
-    const doConnect = React.useCallback(async () => {
-        try {
-
-            // Connect to device
-            let connected = await navigator.bluetooth.requestDevice({
-                filters: [{ name: 'OpenGlass' }],
-                optionalServices: ['19B10000-E8F2-537E-4F6C-D104768A1214'.toLowerCase()],
-            });
-
-            // Connect to gatt
-            let gatt: BluetoothRemoteGATTServer = await connected.gatt!.connect();
-
-            // Update state
-            deviceRef.current = gatt;
-            setDevice(gatt);
-
-            // Reset on disconnect (avoid loosing everything on disconnect)
-            // connected.ongattserverdisconnected = () => {
-            //     deviceRef.current = null;
-            //     setDevice(null);
-            // }
-        } catch (e) {
-            // Handle error
-            console.error(e);
+    const connect = React.useCallback(async () => {
+        setError(undefined);
+        if (typeof navigator === 'undefined' || !navigator.bluetooth) {
+            setError('当前浏览器不支持 Web Bluetooth，请使用 Chrome 或 Edge，并通过 HTTPS/localhost 打开。');
+            return;
         }
+        setConnecting(true);
+        try {
+            const selected = await navigator.bluetooth.requestDevice({
+                filters: [{ name: 'OpenGlass' }],
+                optionalServices: [SERVICE_UUID],
+            });
+            selected.ongattserverdisconnected = () => {
+                setDevice(null);
+                setError('BLE 眼镜已断开，请重新连接后再拍照。');
+            };
+            if (!selected.gatt) throw new Error('设备没有 GATT 服务');
+            await selected.gatt.connect();
+            setDevice(selected);
+        } catch (cause) {
+            const message = cause instanceof Error ? cause.message : String(cause);
+            if (!/cancel|abort/i.test(message)) setError(`BLE 连接失败：${message}`);
+        } finally {
+            setConnecting(false);
+        }
+    }, []);
+
+    const disconnect = React.useCallback(() => {
+        if (device?.gatt?.connected) device.gatt.disconnect();
+        setDevice(null);
     }, [device]);
 
-    // Return
-    return [device, doConnect];
+    return { device, connect, disconnect, connecting, error };
 }

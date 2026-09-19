@@ -4,3 +4,5 @@ dist
 .expo
 .env
 .vscode
+firmware/secrets.h
+.env.local

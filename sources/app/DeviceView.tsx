@@ -1,132 +1,118 @@
 import * as React from 'react';
-import { ActivityIndicator, Image, ScrollView, Text, TextInput, View } from 'react-native';
-import { rotateImage } from '../modules/imaging';
-import { toBase64Image } from '../utils/base64';
+import { ActivityIndicator, Image, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
 import { Agent } from '../agent/Agent';
-import { InvalidateSync } from '../utils/invalidateSync';
-import { textToSpeech } from '../modules/openai';
+import { CameraSource } from '../modules/cameraTransport';
+import { toBase64Image } from '../utils/base64';
 
-function usePhotos(device: BluetoothRemoteGATTServer) {
-
-    // Subscribe to device
-    const [photos, setPhotos] = React.useState<Uint8Array[]>([]);
-    const [subscribed, setSubscribed] = React.useState<boolean>(false);
-    React.useEffect(() => {
-        (async () => {
-
-            let previousChunk = -1;
-            let buffer: Uint8Array = new Uint8Array(0);
-            function onChunk(id: number | null, data: Uint8Array) {
-
-                // Resolve if packet is the first one
-                if (previousChunk === -1) {
-                    if (id === null) {
-                        return;
-                    } else if (id === 0) {
-                        previousChunk = 0;
-                        buffer = new Uint8Array(0);
-                    } else {
-                        return;
-                    }
-                } else {
-                    if (id === null) {
-                        console.log('Photo received', buffer);
-                        rotateImage(buffer, '270').then((rotated) => {
-                            console.log('Rotated photo', rotated);
-                            setPhotos((p) => [...p, rotated]);
-                        });
-                        previousChunk = -1;
-                        return;
-                    } else {
-                        if (id !== previousChunk + 1) {
-                            previousChunk = -1;
-                            console.error('Invalid chunk', id, previousChunk);
-                            return;
-                        }
-                        previousChunk = id;
-                    }
-                }
-
-                // Append data
-                buffer = new Uint8Array([...buffer, ...data]);
-            }
-
-            // Subscribe for photo updates
-            const service = await device.getPrimaryService('19B10000-E8F2-537E-4F6C-D104768A1214'.toLowerCase());
-            const photoCharacteristic = await service.getCharacteristic('19b10005-e8f2-537e-4f6c-d104768a1214');
-            await photoCharacteristic.startNotifications();
-            setSubscribed(true);
-            photoCharacteristic.addEventListener('characteristicvaluechanged', (e) => {
-                let value = (e.target as BluetoothRemoteGATTCharacteristic).value!;
-                let array = new Uint8Array(value.buffer);
-                if (array[0] == 0xff && array[1] == 0xff) {
-                    onChunk(null, new Uint8Array());
-                } else {
-                    let packetId = array[0] + (array[1] << 8);
-                    let packet = array.slice(2);
-                    onChunk(packetId, packet);
-                }
-            });
-            // Start automatic photo capture every 5s
-            const photoControlCharacteristic = await service.getCharacteristic('19b10006-e8f2-537e-4f6c-d104768a1214');
-            await photoControlCharacteristic.writeValue(new Uint8Array([0x05]));
-        })();
-    }, []);
-
-    return [subscribed, photos] as const;
-}
-
-export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer }) => {
-    const [subscribed, photos] = usePhotos(props.device);
+export const DeviceView = React.memo((props: { source: CameraSource; onBack: () => void }) => {
+    const { width } = useWindowDimensions();
+    const narrow = width < 820;
     const agent = React.useMemo(() => new Agent(), []);
     const agentState = agent.use();
+    const [photo, setPhoto] = React.useState<Uint8Array | null>(null);
+    const [captureBusy, setCaptureBusy] = React.useState(false);
+    const [captureError, setCaptureError] = React.useState<string | undefined>();
+    const [question, setQuestion] = React.useState('');
 
-    // Background processing agent
-    const processedPhotos = React.useRef<Uint8Array[]>([]);
-    const sync = React.useMemo(() => {
-        let processed = 0;
-        return new InvalidateSync(async () => {
-            if (processedPhotos.current.length > processed) {
-                let unprocessed = processedPhotos.current.slice(processed);
-                processed = processedPhotos.current.length;
-                await agent.addPhoto(unprocessed);
-            }
-        });
-    }, []);
+    React.useEffect(() => () => props.source.disconnect?.(), [props.source]);
     React.useEffect(() => {
-        processedPhotos.current = photos;
-        sync.invalidate();
-    }, [photos]);
+        if (agentState.answer) void agent.speak(agentState.answer);
+    }, [agent, agentState.answer]);
 
-    React.useEffect(() => {
-        if (agentState.answer) {
-            textToSpeech(agentState.answer)
+    const capture = React.useCallback(async () => {
+        setCaptureBusy(true);
+        setCaptureError(undefined);
+        try {
+            const nextPhoto = await props.source.capture();
+            setPhoto(nextPhoto);
+            await agent.addPhoto(nextPhoto);
+        } catch (error) {
+            setCaptureError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setCaptureBusy(false);
         }
-    }, [agentState.answer])
+    }, [agent, props.source]);
+
+    const submitQuestion = React.useCallback(() => {
+        const value = question.trim();
+        if (!value) return;
+        void agent.answer(value);
+        setQuestion('');
+    }, [agent, question]);
 
     return (
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-            <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}>
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
-                    {photos.map((photo, index) => (
-                        <Image key={index} style={{ width: 100, height: 100 }} source={{ uri: toBase64Image(photo) }} />
-                    ))}
+        <SafeAreaView style={styles.safe}>
+            <View style={[styles.page, narrow && styles.pageNarrow]}>
+                <View style={styles.topbar}>
+                    <Pressable onPress={props.onBack} style={styles.backButton}><Text style={styles.backText}>‹ 返回</Text></Pressable>
+                    <View style={styles.connection}><View style={styles.dot} /><Text style={styles.connectionText}>{props.source.name}</Text></View>
+                </View>
+                <View style={[styles.content, narrow && styles.contentNarrow]}>
+                    <View style={styles.previewColumn}>
+                        <View style={[styles.previewFrame, narrow && styles.previewFrameNarrow]}>
+                            {props.source.previewUrl ? <Image source={{ uri: props.source.previewUrl }} style={styles.preview} resizeMode="cover" /> : photo ? <Image source={{ uri: toBase64Image(photo) }} style={styles.preview} resizeMode="cover" /> : <View style={styles.emptyPreview}><Text style={styles.emptyTitle}>等待拍照</Text><Text style={styles.emptyText}>点击下方按钮获取一张当前画面</Text></View>}
+                            {captureBusy && <View style={styles.previewOverlay}><ActivityIndicator color="#62e6b5" size="large" /><Text style={styles.overlayText}>正在读取当前画面</Text></View>}
+                        </View>
+                        <View style={styles.captureRow}>
+                            <Pressable style={styles.captureButton} onPress={capture} disabled={captureBusy || agentState.loading}><Text style={styles.captureText}>{captureBusy || agentState.loading ? '识别中…' : '拍照识别'}</Text></Pressable>
+                            {captureError && <Text style={styles.error}>{captureError}</Text>}
+                        </View>
+                    </View>
+                    <View style={[styles.answerColumn, narrow && styles.answerColumnNarrow]}>
+                        <Text style={styles.panelLabel}>CURRENT FRAME</Text>
+                        <Text style={styles.panelTitle}>问问眼前画面</Text>
+                        <Text style={styles.panelHint}>模型只会使用最近一次成功识别的画面，不会把旧图片混进回答。</Text>
+                        <View style={styles.answerBox}>
+                            {agentState.loading ? <ActivityIndicator color="#62e6b5" /> : agentState.error ? <Text style={styles.error}>{agentState.error}</Text> : agentState.answer ? <ScrollView><Text style={styles.answer}>{agentState.answer}</Text></ScrollView> : <Text style={styles.placeholder}>拍照后，在这里输入问题。</Text>}
+                        </View>
+                        <View style={styles.questionRow}>
+                            <TextInput value={question} onChangeText={setQuestion} onSubmitEditing={submitQuestion} placeholder="例如：画面里面有什么？" placeholderTextColor="#69717c" style={styles.questionInput} editable={!agentState.loading} returnKeyType="send" />
+                            <Pressable onPress={submitQuestion} style={styles.sendButton} disabled={agentState.loading || !question.trim()}><Text style={styles.sendText}>发送</Text></Pressable>
+                        </View>
+                        {agentState.lastDescription && <Text style={styles.lastDescription}>已更新当前画面识别结果。</Text>}
+                    </View>
                 </View>
             </View>
-
-            <View style={{ backgroundColor: 'rgb(28 28 28)', height: 600, width: 600, borderRadius: 64, flexDirection: 'column', padding: 64 }}>
-                <View style={{ flexGrow: 1, justifyContent: 'center', alignItems: 'center' }}>
-                    {agentState.loading && (<ActivityIndicator size="large" color={"white"} />)}
-                    {agentState.answer && !agentState.loading && (<ScrollView style={{ flexGrow: 1, flexBasis: 0 }}><Text style={{ color: 'white', fontSize: 32 }}>{agentState.answer}</Text></ScrollView>)}
-                </View>
-                <TextInput
-                    style={{ color: 'white', height: 64, fontSize: 32, borderRadius: 16, backgroundColor: 'rgb(48 48 48)', padding: 16 }}
-                    placeholder='What do you need?'
-                    placeholderTextColor={'#888'}
-                    readOnly={agentState.loading}
-                    onSubmitEditing={(e) => agent.answer(e.nativeEvent.text)}
-                />
-            </View>
-        </View>
+        </SafeAreaView>
     );
+});
+
+const styles = StyleSheet.create({
+    safe: { flex: 1, backgroundColor: '#0d1117' },
+    page: { flex: 1, maxWidth: 1180, width: '100%', alignSelf: 'center', padding: 24 },
+    pageNarrow: { padding: 14 },
+    topbar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', minHeight: 48, marginBottom: 18 },
+    backButton: { paddingVertical: 8, paddingRight: 14 },
+    backText: { color: '#d7dee8', fontSize: 15, fontWeight: '600' },
+    connection: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+    dot: { width: 8, height: 8, backgroundColor: '#62e6b5' },
+    connectionText: { color: '#98a2b3', fontSize: 13 },
+    content: { flex: 1, flexDirection: 'row', gap: 20 },
+    contentNarrow: { flexDirection: 'column' },
+    previewColumn: { flex: 1.25 },
+    previewFrame: { flex: 1, minHeight: 440, backgroundColor: '#151b23', borderWidth: 1, borderColor: '#252d38', overflow: 'hidden', position: 'relative' },
+    previewFrameNarrow: { minHeight: 260, aspectRatio: 4 / 3 },
+    preview: { width: '100%', height: '100%' },
+    emptyPreview: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+    emptyTitle: { color: '#f4f7fb', fontSize: 22, fontWeight: '700' },
+    emptyText: { color: '#69717c', fontSize: 14, marginTop: 8, textAlign: 'center' },
+    previewOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(13,17,23,0.72)', alignItems: 'center', justifyContent: 'center' },
+    overlayText: { color: '#d7dee8', fontSize: 14, marginTop: 12 },
+    captureRow: { marginTop: 14 },
+    captureButton: { minHeight: 50, backgroundColor: '#62e6b5', alignItems: 'center', justifyContent: 'center' },
+    captureText: { color: '#0d1117', fontSize: 16, fontWeight: '700' },
+    answerColumn: { flex: 0.85, minWidth: 300, padding: 6 },
+    answerColumnNarrow: { minWidth: 0, padding: 0 },
+    panelLabel: { color: '#62e6b5', fontSize: 12, letterSpacing: 2, fontWeight: '700' },
+    panelTitle: { color: '#f4f7fb', fontSize: 28, fontWeight: '700', marginTop: 10 },
+    panelHint: { color: '#98a2b3', fontSize: 14, lineHeight: 21, marginTop: 10 },
+    answerBox: { flex: 1, minHeight: 180, borderTopWidth: 1, borderBottomWidth: 1, borderColor: '#252d38', marginTop: 24, paddingVertical: 22 },
+    placeholder: { color: '#69717c', fontSize: 17, lineHeight: 25 },
+    answer: { color: '#f4f7fb', fontSize: 22, lineHeight: 32 },
+    questionRow: { flexDirection: 'row', gap: 8, marginTop: 16 },
+    questionInput: { flex: 1, minHeight: 46, color: '#f4f7fb', borderWidth: 1, borderColor: '#3a4553', paddingHorizontal: 12, fontSize: 15 },
+    sendButton: { minWidth: 70, backgroundColor: '#252d38', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 14 },
+    sendText: { color: '#f4f7fb', fontSize: 15, fontWeight: '700' },
+    error: { color: '#ff8f8f', fontSize: 13, lineHeight: 19 },
+    lastDescription: { color: '#62e6b5', fontSize: 12, marginTop: 12 },
 });

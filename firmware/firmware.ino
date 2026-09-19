@@ -5,9 +5,21 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <WiFi.h>
+#include <freertos/semphr.h>
 #include "esp_camera.h"
 #include "camera_pins.h"
 #include "mulaw.h"
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#define OPENGLASS_WIFI_SSID ""
+#define OPENGLASS_WIFI_PASSWORD ""
+#endif
+
+void startCameraServer();
+SemaphoreHandle_t cameraMutex = nullptr;
 
 // Audio
 
@@ -220,21 +232,31 @@ void configure_ble() {
   BLEDevice::startAdvertising();
 }
 
-camera_fb_t *fb;
+camera_fb_t *ble_fb;
 
 bool take_photo() {
   // Release buffer
-  if (fb) {
-    esp_camera_fb_return(fb);
+  if (ble_fb) {
+    esp_camera_fb_return(ble_fb);
+    ble_fb = nullptr;
+  }
+
+  if (!cameraMutex || xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("Camera busy; failed to acquire camera lock");
+    return false;
   }
 
   // Take a photo
-  fb = esp_camera_fb_get();
-  if (!fb) {
+  ble_fb = esp_camera_fb_get();
+  if (!ble_fb) {
+    xSemaphoreGive(cameraMutex);
     Serial.println("Failed to get camera frame buffer");
     return false;
   }
 
+  // Only protect the camera driver call. The BLE transfer can take several
+  // seconds and must not block HTTP capture/stream requests.
+  xSemaphoreGive(cameraMutex);
   return true;
 }
 
@@ -301,9 +323,15 @@ void configure_microphone() {
   }
 
   // Allocate buffers
-  s_recording_buffer = (uint8_t *) ps_calloc(recording_buffer_size, sizeof(uint8_t));
-  s_compressed_frame = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
-  s_compressed_frame_2 = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
+  s_recording_buffer = (uint8_t *) calloc(recording_buffer_size, sizeof(uint8_t));
+  s_compressed_frame = (uint8_t *) calloc(compressed_buffer_size, sizeof(uint8_t));
+  s_compressed_frame_2 = (uint8_t *) calloc(compressed_buffer_size, sizeof(uint8_t));
+  if (!s_recording_buffer || !s_compressed_frame || !s_compressed_frame_2) {
+    Serial.println("Failed to allocate microphone buffers");
+    while (1) {
+      delay(1000);
+    }
+  }
 }
 
 size_t read_microphone() {
@@ -337,26 +365,35 @@ void configure_camera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG; // for streaming
-  config.fb_count = 1;
-
-  // High quality (psram)
-  // config.jpeg_quality = 10;
-  // config.fb_count = 2;
-  // config.grab_mode = CAMERA_GRAB_LATEST;
-
-  // Low quality (and in local ram)
-  config.jpeg_quality = 10;
-  config.frame_size = FRAMESIZE_SVGA;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  // config.fb_location = CAMERA_FB_IN_DRAM;
+  bool hasPsram = psramFound();
+  Serial.printf("Camera memory: PSRAM=%s, free heap=%u\n", hasPsram ? "yes" : "no", ESP.getFreeHeap());
+  if (hasPsram) {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    // The XIAO can be compiled with PSRAM disabled. Keep the fallback small
+    // enough for internal DRAM so camera init does not fail.
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
 
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+  cameraMutex = xSemaphoreCreateMutex();
+  if (!cameraMutex) {
+    Serial.println("Failed to create camera mutex");
+    esp_camera_deinit();
     return;
   }
 }
@@ -372,141 +409,41 @@ void updateBatteryLevel()
 // Main
 //
 
-// static uint8_t *s_compressed_frame_2 = nullptr;
-// static size_t compressed_buffer_size = 400 + 3;
 void setup() {
   Serial.begin(921600);
-  // SD.begin(21);
-  configure_ble();
-  // s_compressed_frame_2 = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
-#ifdef CODEC_OPUS
-  int opus_err;
-  opus_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION, &opus_err);
-  if (opus_err != OPUS_OK || !opus_encoder)
-  {
-    Serial.println("Failed to create Opus encoder!");
-    while (1)
-      ; // do nothing
-  }
-  opus_encoder_ctl(opus_encoder, OPUS_SET_BITRATE(OPUS_BITRATE));
-#endif
-  configure_microphone();
+  Serial.setDebugOutput(true);
+  Serial.println();
   configure_camera();
+  // Wi-Fi-only camera mode: BLE remains compiled for later restoration but
+  // is not initialized or advertised while the camera transport is being
+  // validated.
+  if (strlen(OPENGLASS_WIFI_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    // ESP32-S3 requires modem sleep when Wi-Fi and Bluetooth coexist.
+    WiFi.setSleep(true);
+    WiFi.begin(OPENGLASS_WIFI_SSID, OPENGLASS_WIFI_PASSWORD);
+    Serial.print("Connecting to WiFi");
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Camera Ready! Use http://");
+      Serial.print(WiFi.localIP());
+      Serial.println(" (capture: /capture, stream: :81/stream)");
+      startCameraServer();
+    } else {
+      Serial.println("WiFi unavailable; camera server not started.");
+    }
+  } else {
+    Serial.println("WiFi credentials not configured; camera server not started.");
+  }
 }
 
 void loop() {
-  // Read from mic
-  size_t bytes_recorded = read_microphone();
-
-  // Push audio to BLE
-  if (bytes_recorded > 0 && connected)
-  {
-#ifdef CODEC_OPUS
-    int16_t samples[FRAME_SIZE];
-    for (size_t i = 0; i < bytes_recorded; i += 2)
-    {
-      samples[i / 2] = ((s_recording_buffer[i + 1] << 8) | s_recording_buffer[i]) << VOLUME_GAIN;
-    }
-
-    int encoded_bytes = opus_encode(opus_encoder, samples, FRAME_SIZE, &s_compressed_frame[3], MAX_PACKET_SIZE - 3);
-
-    if (encoded_bytes > 0)
-    {
-#else
-#ifdef CODEC_MULAW
-    for (size_t i = 0; i < bytes_recorded; i += 2)
-    {
-      int16_t sample = ((s_recording_buffer[i + 1] << 8) | s_recording_buffer[i]) << VOLUME_GAIN;
-      s_compressed_frame[i / 2 + 3] = linear2ulaw(sample);
-    }
-
-    int encoded_bytes = bytes_recorded / 2;
-#else
-    for (size_t i = 0; i < bytes_recorded / 4; i++)
-    {
-      int16_t sample = ((int16_t *)s_recording_buffer)[i * 2] << VOLUME_GAIN; // Read every other 16-bit sample
-      s_compressed_frame[i * 2 + 3] = sample & 0xFF;           // Low byte
-      s_compressed_frame[i * 2 + 4] = (sample >> 8) & 0xFF;    // High byte
-    }
-
-    int encoded_bytes = bytes_recorded / 2;
-#endif
-#endif
-
-    s_compressed_frame[0] = audio_frame_count & 0xFF;
-    s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
-    s_compressed_frame[2] = 0;
-
-    size_t out_buffer_size = encoded_bytes + 3;
-    audioDataCharacteristic->setValue(s_compressed_frame, out_buffer_size);
-    audioDataCharacteristic->notify();
-    audio_frame_count++;
-#ifdef CODEC_OPUS
-    }
-#endif
-  }
-
-  // Take a photo
-  unsigned long now = millis();
-
-  // Don't take a photo if we are already sending data for previous photo
-  if (isCapturingPhotos && !photoDataUploading && connected)
-  {
-    if ((captureInterval == 0)
-      || ((now - lastCaptureTime) >= captureInterval))
-    {
-      if (captureInterval == 0) {
-        // Single photo requested
-        isCapturingPhotos = false;
-      }
-
-      // Take the photo
-      if (take_photo())
-      {
-        photoDataUploading = true;
-        sent_photo_bytes = 0;
-        sent_photo_frames = 0;
-        lastCaptureTime = now;
-      }
-    }
-  }
-
-  // Push photo data to BLE
-  if (photoDataUploading) {
-    size_t remaining = fb->len - sent_photo_bytes;
-    if (remaining > 0) {
-      // Populate buffer
-      s_compressed_frame_2[0] = sent_photo_frames & 0xFF;
-      s_compressed_frame_2[1] = (sent_photo_frames >> 8) & 0xFF;
-      size_t bytes_to_copy = remaining;
-      if (bytes_to_copy > 200) {
-        bytes_to_copy = 200;
-      }
-      memcpy(&s_compressed_frame_2[2], &fb->buf[sent_photo_bytes], bytes_to_copy);
-
-      // Push to BLE
-      photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 2);
-      photoDataCharacteristic->notify();
-      sent_photo_bytes += bytes_to_copy;
-      sent_photo_frames++;
-    } else {
-      // End flag
-      s_compressed_frame_2[0] = 0xFF;
-      s_compressed_frame_2[1] = 0xFF;
-      photoDataCharacteristic->setValue(s_compressed_frame_2, 2);
-      photoDataCharacteristic->notify();
-
-      photoDataUploading = false;
-    }
-  }
-
-  // Update battery level
-  if (now - lastBatteryUpdate > 60000)
-  {
-    updateBatteryLevel();
-    lastBatteryUpdate = millis();
-  }
-
-  // Delay
-  delay(20);
+  // CameraWebServer runs in its own HTTP task. Keep loop idle so no audio or
+  // BLE work can contend with camera DMA.
+  delay(10000);
 }

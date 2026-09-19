@@ -25,6 +25,25 @@ Change COM5 to the port name from the board list output
 arduino-cli compile --build-path build --output-dir dist -e -u -p COM5 -b esp32:esp32:XIAO_ESP32S3:PSRAM=opi
 ```
 
+### Wi-Fi camera server
+
+Copy `secrets.example.h` to `secrets.h` and set `OPENGLASS_WIFI_SSID` and
+`OPENGLASS_WIFI_PASSWORD`. The local `secrets.h` file is excluded from Git.
+
+The combined firmware keeps the BLE `OpenGlass` service and also starts:
+
+- `http://<board-ip>/capture` for one JPEG image
+- `http://<board-ip>:81/stream` for the MJPEG preview
+
+The serial monitor runs at `921600` baud and prints `<board-ip>` after a
+successful connection. Wi-Fi startup has a 15-second timeout, so invalid or
+missing credentials do not prevent BLE from advertising.
+
+For the Seeed XIAO ESP32S3 Sense, select the board's actual PSRAM mode in
+Arduino IDE when available (`Tools > PSRAM > OPI PSRAM`). The firmware also
+has a no-PSRAM fallback: it uses one VGA frame buffer in internal DRAM and
+keeps the BLE service alive instead of forcing a PSRAM allocation.
+
 ### Opus support
 
 Go to your Arduino libraries folder.
